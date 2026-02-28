@@ -10,12 +10,56 @@ import (
 	"os/signal"
 	"os/user"
 	"syscall"
+	"time"
 
 	"github.com/martinlindhe/notify"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 	"tailscale.com/ipn/ipnauth"
 )
+
+// ANSI color codes
+const (
+	colorReset  = "\033[0m"
+	colorRed    = "\033[31m"
+	colorGreen  = "\033[32m"
+	colorYellow = "\033[33m"
+	colorBlue   = "\033[34m"
+	colorPurple = "\033[35m"
+	colorCyan   = "\033[36m"
+	colorGray   = "\033[90m"
+	colorBold   = "\033[1m"
+)
+
+// logColored prints a colored log message
+func logColored(socketName, action, message string, actionColor string) {
+	timestamp := time.Now().Format("15:04:05")
+	fmt.Printf("%s%s%s %s[%s]%s %s%s%s %s\n",
+		colorGray, timestamp, colorReset,
+		colorCyan, socketName, colorReset,
+		actionColor, action, colorReset,
+		message)
+}
+
+// logInfo prints an info log message
+func logInfo(format string, args ...interface{}) {
+	timestamp := time.Now().Format("15:04:05")
+	message := fmt.Sprintf(format, args...)
+	fmt.Printf("%s%s%s %s%s%s %s\n",
+		colorGray, timestamp, colorReset,
+		colorBlue, "INFO", colorReset,
+		message)
+}
+
+// logError prints an error log message
+func logError(format string, args ...interface{}) {
+	timestamp := time.Now().Format("15:04:05")
+	message := fmt.Sprintf(format, args...)
+	fmt.Printf("%s%s%s %s%s%s %s\n",
+		colorGray, timestamp, colorReset,
+		colorRed, "ERROR", colorReset,
+		message)
+}
 
 // LoggingAgent is a wrapper around an ssh agent that logs requests.
 type LoggingAgent struct {
@@ -28,7 +72,7 @@ type LoggingAgent struct {
 // List logs the List request and forwards it to the upstream agent.
 func (a *LoggingAgent) List() ([]*agent.Key, error) {
 	processInfo := getProcessInfo(a.conn)
-	log.Printf("[%s] Received request: List from %s", a.socketName, processInfo)
+	logColored(a.socketName, "List", fmt.Sprintf("from %s", processInfo), colorGreen)
 	notify.Notify("SSH Agent", "List", fmt.Sprintf("[%s] Key list request from %s", a.socketName, processInfo), "")
 
 	keys, err := a.upstream.List()
@@ -55,7 +99,7 @@ func (a *LoggingAgent) List() ([]*agent.Key, error) {
 // Sign logs the Sign request and forwards it to the upstream agent.
 func (a *LoggingAgent) Sign(key ssh.PublicKey, data []byte) (*ssh.Signature, error) {
 	processInfo := getProcessInfo(a.conn)
-	log.Printf("[%s] Received request: Sign from %s", a.socketName, processInfo)
+	logColored(a.socketName, "Sign", fmt.Sprintf("from %s", processInfo), colorYellow)
 	notify.Notify("SSH Agent", "Sign", fmt.Sprintf("[%s] Signing request from %s", a.socketName, processInfo), "")
 
 	// Check if key is allowed
@@ -71,37 +115,37 @@ func (a *LoggingAgent) Sign(key ssh.PublicKey, data []byte) (*ssh.Signature, err
 
 // Add is a pass-through to the upstream agent.
 func (a *LoggingAgent) Add(key agent.AddedKey) error {
-	log.Printf("[%s] Received request: Add", a.socketName)
+	logColored(a.socketName, "Add", "key added", colorPurple)
 	return a.upstream.Add(key)
 }
 
 // Remove is a pass-through to the upstream agent.
 func (a *LoggingAgent) Remove(key ssh.PublicKey) error {
-	log.Printf("[%s] Received request: Remove", a.socketName)
+	logColored(a.socketName, "Remove", "key removed", colorRed)
 	return a.upstream.Remove(key)
 }
 
 // RemoveAll is a pass-through to the upstream agent.
 func (a *LoggingAgent) RemoveAll() error {
-	log.Printf("[%s] Received request: RemoveAll", a.socketName)
+	logColored(a.socketName, "RemoveAll", "all keys removed", colorRed)
 	return a.upstream.RemoveAll()
 }
 
 // Lock is a pass-through to the upstream agent.
 func (a *LoggingAgent) Lock(passphrase []byte) error {
-	log.Printf("[%s] Received request: Lock", a.socketName)
+	logColored(a.socketName, "Lock", "agent locked", colorYellow)
 	return a.upstream.Lock(passphrase)
 }
 
 // Unlock is a pass-through to the upstream agent.
 func (a *LoggingAgent) Unlock(passphrase []byte) error {
-	log.Printf("[%s] Received request: Unlock", a.socketName)
+	logColored(a.socketName, "Unlock", "agent unlocked", colorGreen)
 	return a.upstream.Unlock(passphrase)
 }
 
 // Signers is a pass-through to the upstream agent.
 func (a *LoggingAgent) Signers() ([]ssh.Signer, error) {
-	log.Printf("[%s] Received request: Signers", a.socketName)
+	logColored(a.socketName, "Signers", "signers requested", colorBlue)
 	return a.upstream.Signers()
 }
 
@@ -147,22 +191,14 @@ func keyFingerprint(keyBlob []byte) string {
 }
 
 func runProxyActual(inputSocketPath, outputSocketPath, socketName string, allowedKeys map[string]bool, listener net.Listener) error {
-	// Connect to the upstream agent
-	upstreamConn, err := net.Dial("unix", inputSocketPath)
-	if err != nil {
-		return fmt.Errorf("failed to connect to upstream socket %s: %v", inputSocketPath, err)
-	}
-	defer upstreamConn.Close()
-	upstreamAgent := agent.NewClient(upstreamConn)
-
-	log.Printf("[%s] Listening on %s", socketName, outputSocketPath)
+	logInfo("[%s%s%s] Listening on %s%s%s", colorCyan, socketName, colorReset, colorGreen, outputSocketPath, colorReset)
 
 	// Graceful shutdown
 	sigc := make(chan os.Signal, 1)
 	signal.Notify(sigc, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-sigc
-		log.Println("Shutting down...")
+		logInfo("%sShutting down...%s", colorYellow, colorReset)
 		listener.Close()
 		os.Remove(outputSocketPath)
 		os.Exit(0)
@@ -174,13 +210,26 @@ func runProxyActual(inputSocketPath, outputSocketPath, socketName string, allowe
 			// When listener is closed, Accept() returns an error.
 			// We break the loop to allow the program to exit gracefully.
 			if netErr, ok := err.(net.Error); ok && netErr.Temporary() {
-				log.Printf("[%s] Temporary error accepting connection: %v", socketName, err)
+				logError("[%s] Temporary error accepting connection: %v", socketName, err)
 				continue
 			}
 			return err // Return the error when the listener is closed or a non-temporary error occurs
 		}
+
+		// Connect to the upstream agent for each incoming connection
+		upstreamConn, err := net.Dial("unix", inputSocketPath)
+		if err != nil {
+			logError("[%s] Failed to connect to upstream socket %s: %v", socketName, inputSocketPath, err)
+			conn.Close()
+			continue
+		}
+		upstreamAgent := agent.NewClient(upstreamConn)
+
 		loggingAgent := &LoggingAgent{upstream: upstreamAgent, conn: conn, socketName: socketName, allowedKeys: allowedKeys}
-		go agent.ServeAgent(loggingAgent, conn)
+		go func() {
+			agent.ServeAgent(loggingAgent, conn)
+			upstreamConn.Close()
+		}()
 	}
 }
 
@@ -230,9 +279,9 @@ func runServe() error {
 		return fmt.Errorf("failed to load config: %v", err)
 	}
 
-	log.Printf("Using config from %s", configPath)
-	log.Printf("Input socket: %s", config.InputPath)
-	log.Printf("Output sockets: %d configured", len(config.Outputs))
+	logInfo("Using config from %s%s%s", colorCyan, configPath, colorReset)
+	logInfo("Input socket: %s%s%s", colorGreen, config.InputPath, colorReset)
+	logInfo("Output sockets: %s%d configured%s", colorPurple, len(config.Outputs), colorReset)
 
 	if len(config.Outputs) == 0 {
 		return fmt.Errorf("no outputs configured")
@@ -244,9 +293,9 @@ func runServe() error {
 	// Start a proxy for each output
 	for _, output := range config.Outputs {
 		go func(out OutputConfig) {
-			log.Printf("Starting proxy for output '%s' at %s", out.Name, out.Path)
+			logInfo("Starting proxy for output '%s%s%s' at %s%s%s", colorCyan, out.Name, colorReset, colorGreen, out.Path, colorReset)
 			if len(out.AllowedKeys) > 0 {
-				log.Printf("[%s] Filtering to %d allowed keys", out.Name, len(out.AllowedKeys))
+				logInfo("[%s%s%s] Filtering to %s%d%s allowed keys", colorCyan, out.Name, colorReset, colorPurple, len(out.AllowedKeys), colorReset)
 			}
 			if err := runProxy(config.InputPath, out.Path, out.Name, out.AllowedKeys); err != nil {
 				errChan <- fmt.Errorf("proxy '%s' exited with error: %v", out.Name, err)
@@ -261,6 +310,7 @@ func runServe() error {
 
 func main() {
 	if err := runCommand(); err != nil {
-		log.Fatalf("Error: %v", err)
+		logError("%v", err)
+		os.Exit(1)
 	}
 }
