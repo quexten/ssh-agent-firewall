@@ -9,9 +9,10 @@ import (
 
 // OutputConfig represents a single output socket configuration.
 type OutputConfig struct {
-	Name        string   `json:"name"`
-	Path        string   `json:"path"`
-	AllowedKeys []string `json:"allowed_keys,omitempty"` // List of allowed key fingerprints (SHA256). If empty, all keys are allowed.
+	Name            string   `json:"name"`
+	Path            string   `json:"path"`
+	AllowedKeys     []string `json:"allowed_keys,omitempty"`     // List of allowed key fingerprints (SHA256). If empty, all keys are allowed.
+	RequireApproval bool     `json:"require_approval,omitempty"` // If true, require interactive approval for each sign operation.
 }
 
 // Config represents the application configuration.

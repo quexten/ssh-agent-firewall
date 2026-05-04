@@ -38,17 +38,19 @@ func (p ProcessInfo) String() string {
 
 // Event represents a single structured log event.
 type Event struct {
-	Timestamp      time.Time `json:"timestamp"`
-	Socket         string    `json:"socket"`
-	Action         string    `json:"action"`
-	PID            int       `json:"pid"`
-	ProcessName    string    `json:"process_name,omitempty"`
-	Username       string    `json:"username,omitempty"`
-	KeyFingerprint string    `json:"key_fingerprint,omitempty"`
-	KeysReturned   int       `json:"keys_returned,omitempty"`
-	Allowed        *bool     `json:"allowed,omitempty"`
-	DestHost       string    `json:"dest_host,omitempty"`
-	Message        string    `json:"message,omitempty"`
+	Timestamp         time.Time `json:"timestamp"`
+	Socket            string    `json:"socket"`
+	Action            string    `json:"action"`
+	PID               int       `json:"pid"`
+	ProcessName       string    `json:"process_name,omitempty"`
+	Username          string    `json:"username,omitempty"`
+	KeyFingerprint    string    `json:"key_fingerprint,omitempty"`
+	KeysReturned      int       `json:"keys_returned,omitempty"`
+	Allowed           *bool     `json:"allowed,omitempty"`
+	DestHost          string    `json:"dest_host,omitempty"`
+	ApprovalRequested bool      `json:"approval_requested,omitempty"`
+	ApprovalDecision  string    `json:"approval_decision,omitempty"` // "granted", "denied", "timeout"
+	Message           string    `json:"message,omitempty"`
 }
 
 func (e Event) String() string {

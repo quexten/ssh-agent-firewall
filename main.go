@@ -66,12 +66,13 @@ func logError(format string, args ...interface{}) {
 // It implements agent.ExtendedAgent to support SignWithFlags and Extension messages
 // (including session-bind@openssh.com forwarding and host-bound authentication).
 type LoggingAgent struct {
-	upstream    agent.ExtendedAgent
-	conn        net.Conn
-	socketName  string
-	allowedKeys map[string]bool // Set of allowed key fingerprints (SHA256). If nil/empty, all keys are allowed.
-	eventLogger *EventLogger
-	knownHosts  *KnownHostsIndex
+	upstream        agent.ExtendedAgent
+	conn            net.Conn
+	socketName      string
+	allowedKeys     map[string]bool // Set of allowed key fingerprints (SHA256). If nil/empty, all keys are allowed.
+	eventLogger     *EventLogger
+	knownHosts      *KnownHostsIndex
+	requireApproval bool // If true, require interactive approval for each sign operation.
 }
 
 // List logs the List request and forwards it to the upstream agent.
@@ -148,25 +149,68 @@ func (a *LoggingAgent) Sign(key ssh.PublicKey, data []byte) (*ssh.Signature, err
 	}
 
 	// Try to parse authentication info from the signing data
+	destHost := ""
 	if authInfo, err := parseAuthData(data); err == nil && authInfo != nil {
 		authDetails := formatAuthRequestInfo(authInfo, a.knownHosts)
 		logColored(a.socketName, "Auth", fmt.Sprintf("from %s %s", processInfo, authDetails), colorPurple)
 		notify.Notify("SSH Agent", "Authenticate", signNotificationMessage(a.socketName, processInfo, authInfo, a.knownHosts), "")
+		if authInfo.IsHostBound && authInfo.ServerHostKeyFingerprint != "" && a.knownHosts != nil {
+			if hosts := a.knownHosts.Lookup(authInfo.ServerHostKeyFingerprint); len(hosts) > 0 {
+				destHost = strings.Join(hosts, ", ")
+			}
+		}
 	} else {
 		notify.Notify("SSH Agent", "Authenticate", fmt.Sprintf("[%s] Signing key=%s from %s", a.socketName, fp, processInfo), "")
+	}
+
+	// Check if approval is required
+	approvalRequested := false
+	approvalDecision := ""
+	if a.requireApproval {
+		approvalRequested = true
+		req := ApprovalRequest{
+			SocketName:     a.socketName,
+			KeyFingerprint: fp,
+			ProcessInfo:    processInfo,
+			DestHost:       destHost,
+			Timestamp:      time.Now(),
+		}
+		approved, decision := requestApproval(req, 30*time.Second)
+		approvalDecision = decision
+		logColored(a.socketName, "Approval", fmt.Sprintf("from %s: %s", processInfo, decision), colorPurple)
+
+		if !approved {
+			allowed := false
+			a.eventLogger.LogEvent(Event{
+				Timestamp:         time.Now(),
+				Socket:            a.socketName,
+				Action:            "sign",
+				PID:               pinfo.PID,
+				ProcessName:       pinfo.ProcessName,
+				Username:          pinfo.Username,
+				KeyFingerprint:    fp,
+				Allowed:           &allowed,
+				ApprovalRequested: approvalRequested,
+				ApprovalDecision:  approvalDecision,
+				Message:           fmt.Sprintf("approval %s", decision),
+			})
+			return nil, fmt.Errorf("signing request not approved")
+		}
 	}
 
 	sig, err := a.upstream.Sign(key, data)
 	allowed := err == nil
 	event := Event{
-		Timestamp:      time.Now(),
-		Socket:         a.socketName,
-		Action:         "sign",
-		PID:            pinfo.PID,
-		ProcessName:    pinfo.ProcessName,
-		Username:       pinfo.Username,
-		KeyFingerprint: fp,
-		Allowed:        &allowed,
+		Timestamp:         time.Now(),
+		Socket:            a.socketName,
+		Action:            "sign",
+		PID:               pinfo.PID,
+		ProcessName:       pinfo.ProcessName,
+		Username:          pinfo.Username,
+		KeyFingerprint:    fp,
+		Allowed:           &allowed,
+		ApprovalRequested: approvalRequested,
+		ApprovalDecision:  approvalDecision,
 	}
 	if err != nil {
 		event.Message = err.Error()
@@ -261,23 +305,64 @@ func (a *LoggingAgent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent
 	logColored(a.socketName, "SignFlags", fmt.Sprintf("from %s key=%s flags=%d", processInfo, fp, flags), colorYellow)
 
 	// Try to parse authentication info from the signing data
+	destHost := ""
 	if authInfo, err := parseAuthData(data); err == nil && authInfo != nil {
 		authDetails := formatAuthRequestInfo(authInfo, a.knownHosts)
 		logColored(a.socketName, "Auth", fmt.Sprintf("from %s %s", processInfo, authDetails), colorPurple)
 		notify.Notify("SSH Agent", "Sign", signNotificationMessage(a.socketName, processInfo, authInfo, a.knownHosts), "")
+		if authInfo.IsHostBound && authInfo.ServerHostKeyFingerprint != "" && a.knownHosts != nil {
+			if hosts := a.knownHosts.Lookup(authInfo.ServerHostKeyFingerprint); len(hosts) > 0 {
+				destHost = strings.Join(hosts, ", ")
+			}
+		}
 	} else {
 		notify.Notify("SSH Agent", "Sign", fmt.Sprintf("[%s] Signing key=%s from %s", a.socketName, fp, processInfo), "")
 	}
 
+	// Check if approval is required
+	approvalRequested := false
+	approvalDecision := ""
+	if a.requireApproval {
+		approvalRequested = true
+		req := ApprovalRequest{
+			SocketName:     a.socketName,
+			KeyFingerprint: fp,
+			ProcessInfo:    processInfo,
+			DestHost:       destHost,
+			Timestamp:      time.Now(),
+		}
+		approved, decision := requestApproval(req, 30*time.Second)
+		approvalDecision = decision
+		logColored(a.socketName, "Approval", fmt.Sprintf("from %s: %s", processInfo, decision), colorPurple)
+
+		if !approved {
+			a.eventLogger.LogEvent(Event{
+				Timestamp:         time.Now(),
+				Socket:            a.socketName,
+				Action:            "sign_with_flags",
+				PID:               pinfo.PID,
+				ProcessName:       pinfo.ProcessName,
+				Username:          pinfo.Username,
+				KeyFingerprint:    fp,
+				Message:           fmt.Sprintf("flags=%d; approval %s", flags, decision),
+				ApprovalRequested: approvalRequested,
+				ApprovalDecision:  approvalDecision,
+			})
+			return nil, fmt.Errorf("signing request not approved")
+		}
+	}
+
 	a.eventLogger.LogEvent(Event{
-		Timestamp:      time.Now(),
-		Socket:         a.socketName,
-		Action:         "sign_with_flags",
-		PID:            pinfo.PID,
-		ProcessName:    pinfo.ProcessName,
-		Username:       pinfo.Username,
-		KeyFingerprint: fp,
-		Message:        fmt.Sprintf("flags=%d", flags),
+		Timestamp:         time.Now(),
+		Socket:            a.socketName,
+		Action:            "sign_with_flags",
+		PID:               pinfo.PID,
+		ProcessName:       pinfo.ProcessName,
+		Username:          pinfo.Username,
+		KeyFingerprint:    fp,
+		Message:           fmt.Sprintf("flags=%d", flags),
+		ApprovalRequested: approvalRequested,
+		ApprovalDecision:  approvalDecision,
 	})
 
 	return a.upstream.SignWithFlags(key, data, flags)
@@ -398,7 +483,7 @@ func keyFingerprint(keyBlob []byte) string {
 	return "SHA256:" + base64.StdEncoding.EncodeToString(hash[:])
 }
 
-func runProxyActual(inputSocketPath, outputSocketPath, socketName string, allowedKeys map[string]bool, listener net.Listener, eventLogger *EventLogger, knownHosts *KnownHostsIndex) error {
+func runProxyActual(inputSocketPath, outputSocketPath, socketName string, allowedKeys map[string]bool, listener net.Listener, requireApproval bool, eventLogger *EventLogger, knownHosts *KnownHostsIndex) error {
 	logInfo("[%s%s%s] Listening on %s%s%s", colorCyan, socketName, colorReset, colorGreen, outputSocketPath, colorReset)
 
 	// Graceful shutdown
@@ -433,7 +518,7 @@ func runProxyActual(inputSocketPath, outputSocketPath, socketName string, allowe
 		}
 		upstreamAgent := agent.NewClient(upstreamConn)
 
-		loggingAgent := &LoggingAgent{upstream: upstreamAgent, conn: conn, socketName: socketName, allowedKeys: allowedKeys, eventLogger: eventLogger, knownHosts: knownHosts}
+		loggingAgent := &LoggingAgent{upstream: upstreamAgent, conn: conn, socketName: socketName, allowedKeys: allowedKeys, eventLogger: eventLogger, knownHosts: knownHosts, requireApproval: requireApproval}
 		go func() {
 			agent.ServeAgent(loggingAgent, conn)
 			upstreamConn.Close()
@@ -443,7 +528,7 @@ func runProxyActual(inputSocketPath, outputSocketPath, socketName string, allowe
 
 // runProxy is a helper for main to ensure socket cleanup.
 // It calls runProxyActual.
-func runProxy(inputSocketPath, outputSocketPath, socketName string, allowedKeys []string, eventLogger *EventLogger, knownHosts *KnownHostsIndex) error {
+func runProxy(inputSocketPath, outputSocketPath, socketName string, allowedKeys []string, requireApproval bool, eventLogger *EventLogger, knownHosts *KnownHostsIndex) error {
 	// Clean up the output socket path if it already exists
 	if _, err := os.Stat(outputSocketPath); err == nil {
 		if err := os.Remove(outputSocketPath); err != nil {
@@ -464,14 +549,14 @@ func runProxy(inputSocketPath, outputSocketPath, socketName string, allowedKeys 
 		allowedKeysMap[fp] = true
 	}
 
-	return runProxyActual(inputSocketPath, outputSocketPath, socketName, allowedKeysMap, listener, eventLogger, knownHosts)
+	return runProxyActual(inputSocketPath, outputSocketPath, socketName, allowedKeysMap, listener, requireApproval, eventLogger, knownHosts)
 }
 
 // runProxyForTest is an internal helper for testing that signals when the proxy is ready.
-func runProxyForTest(inputSocketPath, outputSocketPath, socketName string, allowedKeys map[string]bool, listener net.Listener, ready chan<- struct{}, eventLogger *EventLogger, knownHosts *KnownHostsIndex) error {
+func runProxyForTest(inputSocketPath, outputSocketPath, socketName string, allowedKeys map[string]bool, listener net.Listener, requireApproval bool, ready chan<- struct{}, eventLogger *EventLogger, knownHosts *KnownHostsIndex) error {
 	// Signal that the proxy is ready to accept connections
 	close(ready)
-	return runProxyActual(inputSocketPath, outputSocketPath, socketName, allowedKeys, listener, eventLogger, knownHosts)
+	return runProxyActual(inputSocketPath, outputSocketPath, socketName, allowedKeys, listener, requireApproval, eventLogger, knownHosts)
 }
 
 // runServe starts the SSH agent proxy server
@@ -520,7 +605,7 @@ func runServe() error {
 			if len(out.AllowedKeys) > 0 {
 				logInfo("[%s%s%s] Filtering to %s%d%s allowed keys", colorCyan, out.Name, colorReset, colorPurple, len(out.AllowedKeys), colorReset)
 			}
-			if err := runProxy(config.InputPath, out.Path, out.Name, out.AllowedKeys, eventLogger, knownHosts); err != nil {
+			if err := runProxy(config.InputPath, out.Path, out.Name, out.AllowedKeys, true, eventLogger, knownHosts); err != nil {
 				errChan <- fmt.Errorf("proxy '%s' exited with error: %v", out.Name, err)
 			}
 		}(output)
