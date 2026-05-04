@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"os/user"
+	"strings"
 	"syscall"
 	"time"
 
@@ -62,18 +63,22 @@ func logError(format string, args ...interface{}) {
 }
 
 // LoggingAgent is a wrapper around an ssh agent that logs requests.
+// It implements agent.ExtendedAgent to support SignWithFlags and Extension messages
+// (including session-bind@openssh.com forwarding and host-bound authentication).
 type LoggingAgent struct {
-	upstream    agent.Agent
+	upstream    agent.ExtendedAgent
 	conn        net.Conn
 	socketName  string
 	allowedKeys map[string]bool // Set of allowed key fingerprints (SHA256). If nil/empty, all keys are allowed.
+	eventLogger *EventLogger
+	knownHosts  *KnownHostsIndex
 }
 
 // List logs the List request and forwards it to the upstream agent.
 func (a *LoggingAgent) List() ([]*agent.Key, error) {
-	processInfo := getProcessInfo(a.conn)
+	pinfo := getProcessInfoStruct(a.conn)
+	processInfo := pinfo.String()
 	logColored(a.socketName, "List", fmt.Sprintf("from %s", processInfo), colorGreen)
-	notify.Notify("SSH Agent", "List", fmt.Sprintf("[%s] Key list request from %s", a.socketName, processInfo), "")
 
 	keys, err := a.upstream.List()
 	if err != nil {
@@ -82,6 +87,15 @@ func (a *LoggingAgent) List() ([]*agent.Key, error) {
 
 	// If no allowed keys configured, return all keys
 	if len(a.allowedKeys) == 0 {
+		a.eventLogger.LogEvent(Event{
+			Timestamp:    time.Now(),
+			Socket:       a.socketName,
+			Action:       "list",
+			PID:          pinfo.PID,
+			ProcessName:  pinfo.ProcessName,
+			Username:     pinfo.Username,
+			KeysReturned: len(keys),
+		})
 		return keys, nil
 	}
 
@@ -93,81 +107,264 @@ func (a *LoggingAgent) List() ([]*agent.Key, error) {
 			filtered = append(filtered, key)
 		}
 	}
+
+	a.eventLogger.LogEvent(Event{
+		Timestamp:    time.Now(),
+		Socket:       a.socketName,
+		Action:       "list",
+		PID:          pinfo.PID,
+		ProcessName:  pinfo.ProcessName,
+		Username:     pinfo.Username,
+		KeysReturned: len(filtered),
+	})
+
 	return filtered, nil
 }
 
 // Sign logs the Sign request and forwards it to the upstream agent.
 func (a *LoggingAgent) Sign(key ssh.PublicKey, data []byte) (*ssh.Signature, error) {
-	processInfo := getProcessInfo(a.conn)
-	logColored(a.socketName, "Sign", fmt.Sprintf("from %s", processInfo), colorYellow)
-	notify.Notify("SSH Agent", "Sign", fmt.Sprintf("[%s] Signing request from %s", a.socketName, processInfo), "")
+	pinfo := getProcessInfoStruct(a.conn)
+	processInfo := pinfo.String()
+	fp := keyFingerprint(key.Marshal())
+	logColored(a.socketName, "Sign", fmt.Sprintf("from %s key=%s", processInfo, fp), colorYellow)
 
 	// Check if key is allowed
 	if len(a.allowedKeys) > 0 {
-		fp := keyFingerprint(key.Marshal())
 		if !a.allowedKeys[fp] {
+			allowed := false
+			a.eventLogger.LogEvent(Event{
+				Timestamp:      time.Now(),
+				Socket:         a.socketName,
+				Action:         "sign",
+				PID:            pinfo.PID,
+				ProcessName:    pinfo.ProcessName,
+				Username:       pinfo.Username,
+				KeyFingerprint: fp,
+				Allowed:        &allowed,
+				Message:        "key not allowed for this socket",
+			})
 			return nil, fmt.Errorf("key not allowed for this socket")
 		}
 	}
 
-	return a.upstream.Sign(key, data)
+	// Try to parse authentication info from the signing data
+	if authInfo, err := parseAuthData(data); err == nil && authInfo != nil {
+		authDetails := formatAuthRequestInfo(authInfo, a.knownHosts)
+		logColored(a.socketName, "Auth", fmt.Sprintf("from %s %s", processInfo, authDetails), colorPurple)
+		notify.Notify("SSH Agent", "Authenticate", signNotificationMessage(a.socketName, processInfo, authInfo, a.knownHosts), "")
+	} else {
+		notify.Notify("SSH Agent", "Authenticate", fmt.Sprintf("[%s] Signing key=%s from %s", a.socketName, fp, processInfo), "")
+	}
+
+	sig, err := a.upstream.Sign(key, data)
+	allowed := err == nil
+	event := Event{
+		Timestamp:      time.Now(),
+		Socket:         a.socketName,
+		Action:         "sign",
+		PID:            pinfo.PID,
+		ProcessName:    pinfo.ProcessName,
+		Username:       pinfo.Username,
+		KeyFingerprint: fp,
+		Allowed:        &allowed,
+	}
+	if err != nil {
+		event.Message = err.Error()
+	}
+	a.eventLogger.LogEvent(event)
+	return sig, err
 }
 
 // Add is a pass-through to the upstream agent.
 func (a *LoggingAgent) Add(key agent.AddedKey) error {
-	logColored(a.socketName, "Add", "key added", colorPurple)
+	pinfo := getProcessInfoStruct(a.conn)
+	logColored(a.socketName, "Add", fmt.Sprintf("key added by %s", pinfo.String()), colorPurple)
+	a.eventLogger.LogEvent(Event{
+		Timestamp:   time.Now(),
+		Socket:      a.socketName,
+		Action:      "add",
+		PID:         pinfo.PID,
+		ProcessName: pinfo.ProcessName,
+		Username:    pinfo.Username,
+	})
 	return a.upstream.Add(key)
 }
 
 // Remove is a pass-through to the upstream agent.
 func (a *LoggingAgent) Remove(key ssh.PublicKey) error {
-	logColored(a.socketName, "Remove", "key removed", colorRed)
+	pinfo := getProcessInfoStruct(a.conn)
+	fp := keyFingerprint(key.Marshal())
+	logColored(a.socketName, "Remove", fmt.Sprintf("key removed by %s key=%s", pinfo.String(), fp), colorRed)
+	a.eventLogger.LogEvent(Event{
+		Timestamp:      time.Now(),
+		Socket:         a.socketName,
+		Action:         "remove",
+		PID:            pinfo.PID,
+		ProcessName:    pinfo.ProcessName,
+		Username:       pinfo.Username,
+		KeyFingerprint: fp,
+	})
 	return a.upstream.Remove(key)
 }
 
 // RemoveAll is a pass-through to the upstream agent.
 func (a *LoggingAgent) RemoveAll() error {
-	logColored(a.socketName, "RemoveAll", "all keys removed", colorRed)
+	pinfo := getProcessInfoStruct(a.conn)
+	logColored(a.socketName, "RemoveAll", fmt.Sprintf("all keys removed by %s", pinfo.String()), colorRed)
+	a.eventLogger.LogEvent(Event{
+		Timestamp:   time.Now(),
+		Socket:      a.socketName,
+		Action:      "remove_all",
+		PID:         pinfo.PID,
+		ProcessName: pinfo.ProcessName,
+		Username:    pinfo.Username,
+	})
 	return a.upstream.RemoveAll()
 }
 
 // Lock is a pass-through to the upstream agent.
 func (a *LoggingAgent) Lock(passphrase []byte) error {
-	logColored(a.socketName, "Lock", "agent locked", colorYellow)
+	pinfo := getProcessInfoStruct(a.conn)
+	logColored(a.socketName, "Lock", fmt.Sprintf("agent locked by %s", pinfo.String()), colorYellow)
+	a.eventLogger.LogEvent(Event{
+		Timestamp:   time.Now(),
+		Socket:      a.socketName,
+		Action:      "lock",
+		PID:         pinfo.PID,
+		ProcessName: pinfo.ProcessName,
+		Username:    pinfo.Username,
+	})
 	return a.upstream.Lock(passphrase)
 }
 
 // Unlock is a pass-through to the upstream agent.
 func (a *LoggingAgent) Unlock(passphrase []byte) error {
-	logColored(a.socketName, "Unlock", "agent unlocked", colorGreen)
+	pinfo := getProcessInfoStruct(a.conn)
+	logColored(a.socketName, "Unlock", fmt.Sprintf("agent unlocked by %s", pinfo.String()), colorGreen)
+	a.eventLogger.LogEvent(Event{
+		Timestamp:   time.Now(),
+		Socket:      a.socketName,
+		Action:      "unlock",
+		PID:         pinfo.PID,
+		ProcessName: pinfo.ProcessName,
+		Username:    pinfo.Username,
+	})
 	return a.upstream.Unlock(passphrase)
+}
+
+// SignWithFlags logs the SignWithFlags request and forwards it to the upstream agent.
+// This handles sign requests with flags (e.g. RSA SHA-256/SHA-512).
+func (a *LoggingAgent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.SignatureFlags) (*ssh.Signature, error) {
+	pinfo := getProcessInfoStruct(a.conn)
+	processInfo := pinfo.String()
+	fp := keyFingerprint(key.Marshal())
+	logColored(a.socketName, "SignFlags", fmt.Sprintf("from %s key=%s flags=%d", processInfo, fp, flags), colorYellow)
+
+	// Try to parse authentication info from the signing data
+	if authInfo, err := parseAuthData(data); err == nil && authInfo != nil {
+		authDetails := formatAuthRequestInfo(authInfo, a.knownHosts)
+		logColored(a.socketName, "Auth", fmt.Sprintf("from %s %s", processInfo, authDetails), colorPurple)
+		notify.Notify("SSH Agent", "Sign", signNotificationMessage(a.socketName, processInfo, authInfo, a.knownHosts), "")
+	} else {
+		notify.Notify("SSH Agent", "Sign", fmt.Sprintf("[%s] Signing key=%s from %s", a.socketName, fp, processInfo), "")
+	}
+
+	a.eventLogger.LogEvent(Event{
+		Timestamp:      time.Now(),
+		Socket:         a.socketName,
+		Action:         "sign_with_flags",
+		PID:            pinfo.PID,
+		ProcessName:    pinfo.ProcessName,
+		Username:       pinfo.Username,
+		KeyFingerprint: fp,
+		Message:        fmt.Sprintf("flags=%d", flags),
+	})
+
+	return a.upstream.SignWithFlags(key, data, flags)
+}
+
+// Extension handles agent protocol extension messages.
+// It parses and logs session-bind@openssh.com forwarding messages and
+// other extension types, then forwards them to the upstream agent.
+func (a *LoggingAgent) Extension(extensionType string, contents []byte) ([]byte, error) {
+	pinfo := getProcessInfoStruct(a.conn)
+	processInfo := pinfo.String()
+
+	switch extensionType {
+	case "session-bind@openssh.com":
+		bindInfo, err := parseSessionBind(contents)
+		if err != nil {
+			logColored(a.socketName, "SessionBind", fmt.Sprintf("from %s (parse error: %v)", processInfo, err), colorYellow)
+		} else {
+			details := formatSessionBindInfo(bindInfo, a.knownHosts)
+			logColored(a.socketName, "SessionBind", fmt.Sprintf("from %s %s", processInfo, details), colorPurple)
+		}
+		destHost := ""
+		if bindInfo != nil && a.knownHosts != nil {
+			if hosts := a.knownHosts.Lookup(bindInfo.HostKeyFingerprint); len(hosts) > 0 {
+				destHost = strings.Join(hosts, ", ")
+			}
+		}
+		a.eventLogger.LogEvent(Event{
+			Timestamp:   time.Now(),
+			Socket:      a.socketName,
+			Action:      "session_bind",
+			PID:         pinfo.PID,
+			ProcessName: pinfo.ProcessName,
+			Username:    pinfo.Username,
+			DestHost:    destHost,
+			Message:     fmt.Sprintf("extension=%s", extensionType),
+		})
+	default:
+		logColored(a.socketName, "Extension", fmt.Sprintf("from %s type=%s", processInfo, extensionType), colorBlue)
+		a.eventLogger.LogEvent(Event{
+			Timestamp:   time.Now(),
+			Socket:      a.socketName,
+			Action:      "extension",
+			PID:         pinfo.PID,
+			ProcessName: pinfo.ProcessName,
+			Username:    pinfo.Username,
+			Message:     fmt.Sprintf("extension=%s", extensionType),
+		})
+	}
+
+	return a.upstream.Extension(extensionType, contents)
 }
 
 // Signers is a pass-through to the upstream agent.
 func (a *LoggingAgent) Signers() ([]ssh.Signer, error) {
-	logColored(a.socketName, "Signers", "signers requested", colorBlue)
+	pinfo := getProcessInfoStruct(a.conn)
+	logColored(a.socketName, "Signers", fmt.Sprintf("signers requested by %s", pinfo.String()), colorBlue)
+	a.eventLogger.LogEvent(Event{
+		Timestamp:   time.Now(),
+		Socket:      a.socketName,
+		Action:      "signers",
+		PID:         pinfo.PID,
+		ProcessName: pinfo.ProcessName,
+		Username:    pinfo.Username,
+	})
 	return a.upstream.Signers()
 }
 
-// getProcessInfo returns information about the connecting process.
-func getProcessInfo(conn net.Conn) string {
+// getProcessInfoStruct returns structured information about the connecting process.
+func getProcessInfoStruct(conn net.Conn) ProcessInfo {
 	ci, err := ipnauth.GetConnIdentity(log.Printf, conn)
 	if err != nil {
-		return "unknown process"
+		return ProcessInfo{}
 	}
 
 	pid := ci.Pid()
 	if pid == 0 {
-		return "unknown process"
+		return ProcessInfo{}
 	}
 
-	info := fmt.Sprintf("PID %d", pid)
+	pinfo := ProcessInfo{PID: int(pid)}
 
 	// Try to get user info
 	if creds := ci.Creds(); creds != nil {
 		if uid, ok := creds.UserID(); ok {
 			if u, err := user.LookupId(uid); err == nil {
-				info = fmt.Sprintf("%s (%s)", u.Username, info)
+				pinfo.Username = u.Username
 			}
 		}
 	}
@@ -178,10 +375,21 @@ func getProcessInfo(conn net.Conn) string {
 		if len(processName) > 0 && processName[len(processName)-1] == '\n' {
 			processName = processName[:len(processName)-1]
 		}
-		info = fmt.Sprintf("%s [%s]", processName, info)
+		pinfo.ProcessName = processName
 	}
 
-	return info
+	// Detect sandbox (Flatpak / Snap)
+	if sandbox := detectSandbox(int(pid)); sandbox.Sandboxed {
+		pinfo.SandboxRuntime = sandbox.Runtime
+		pinfo.SandboxApp = sandbox.AppName
+	}
+
+	return pinfo
+}
+
+// getProcessInfo returns a human-readable string about the connecting process.
+func getProcessInfo(conn net.Conn) string {
+	return getProcessInfoStruct(conn).String()
 }
 
 // keyFingerprint returns the SHA256 fingerprint of a key in the format "SHA256:..."
@@ -190,7 +398,7 @@ func keyFingerprint(keyBlob []byte) string {
 	return "SHA256:" + base64.StdEncoding.EncodeToString(hash[:])
 }
 
-func runProxyActual(inputSocketPath, outputSocketPath, socketName string, allowedKeys map[string]bool, listener net.Listener) error {
+func runProxyActual(inputSocketPath, outputSocketPath, socketName string, allowedKeys map[string]bool, listener net.Listener, eventLogger *EventLogger, knownHosts *KnownHostsIndex) error {
 	logInfo("[%s%s%s] Listening on %s%s%s", colorCyan, socketName, colorReset, colorGreen, outputSocketPath, colorReset)
 
 	// Graceful shutdown
@@ -225,7 +433,7 @@ func runProxyActual(inputSocketPath, outputSocketPath, socketName string, allowe
 		}
 		upstreamAgent := agent.NewClient(upstreamConn)
 
-		loggingAgent := &LoggingAgent{upstream: upstreamAgent, conn: conn, socketName: socketName, allowedKeys: allowedKeys}
+		loggingAgent := &LoggingAgent{upstream: upstreamAgent, conn: conn, socketName: socketName, allowedKeys: allowedKeys, eventLogger: eventLogger, knownHosts: knownHosts}
 		go func() {
 			agent.ServeAgent(loggingAgent, conn)
 			upstreamConn.Close()
@@ -235,7 +443,7 @@ func runProxyActual(inputSocketPath, outputSocketPath, socketName string, allowe
 
 // runProxy is a helper for main to ensure socket cleanup.
 // It calls runProxyActual.
-func runProxy(inputSocketPath, outputSocketPath, socketName string, allowedKeys []string) error {
+func runProxy(inputSocketPath, outputSocketPath, socketName string, allowedKeys []string, eventLogger *EventLogger, knownHosts *KnownHostsIndex) error {
 	// Clean up the output socket path if it already exists
 	if _, err := os.Stat(outputSocketPath); err == nil {
 		if err := os.Remove(outputSocketPath); err != nil {
@@ -256,14 +464,14 @@ func runProxy(inputSocketPath, outputSocketPath, socketName string, allowedKeys 
 		allowedKeysMap[fp] = true
 	}
 
-	return runProxyActual(inputSocketPath, outputSocketPath, socketName, allowedKeysMap, listener)
+	return runProxyActual(inputSocketPath, outputSocketPath, socketName, allowedKeysMap, listener, eventLogger, knownHosts)
 }
 
 // runProxyForTest is an internal helper for testing that signals when the proxy is ready.
-func runProxyForTest(inputSocketPath, outputSocketPath, socketName string, allowedKeys map[string]bool, listener net.Listener, ready chan<- struct{}) error {
+func runProxyForTest(inputSocketPath, outputSocketPath, socketName string, allowedKeys map[string]bool, listener net.Listener, ready chan<- struct{}, eventLogger *EventLogger, knownHosts *KnownHostsIndex) error {
 	// Signal that the proxy is ready to accept connections
 	close(ready)
-	return runProxyActual(inputSocketPath, outputSocketPath, socketName, allowedKeys, listener)
+	return runProxyActual(inputSocketPath, outputSocketPath, socketName, allowedKeys, listener, eventLogger, knownHosts)
 }
 
 // runServe starts the SSH agent proxy server
@@ -279,7 +487,22 @@ func runServe() error {
 		return fmt.Errorf("failed to load config: %v", err)
 	}
 
+	// Set up event logger
+	logPath, err := DefaultLogPath()
+	if err != nil {
+		return fmt.Errorf("failed to get log path: %v", err)
+	}
+	eventLogger, err := NewEventLogger(logPath)
+	if err != nil {
+		return fmt.Errorf("failed to create event logger: %v", err)
+	}
+	defer eventLogger.Close()
+
 	logInfo("Using config from %s%s%s", colorCyan, configPath, colorReset)
+	// Load known_hosts index for hostname resolution
+	knownHosts := LoadKnownHostsIndex()
+
+	logInfo("Event log: %s%s%s", colorCyan, logPath, colorReset)
 	logInfo("Input socket: %s%s%s", colorGreen, config.InputPath, colorReset)
 	logInfo("Output sockets: %s%d configured%s", colorPurple, len(config.Outputs), colorReset)
 
@@ -297,7 +520,7 @@ func runServe() error {
 			if len(out.AllowedKeys) > 0 {
 				logInfo("[%s%s%s] Filtering to %s%d%s allowed keys", colorCyan, out.Name, colorReset, colorPurple, len(out.AllowedKeys), colorReset)
 			}
-			if err := runProxy(config.InputPath, out.Path, out.Name, out.AllowedKeys); err != nil {
+			if err := runProxy(config.InputPath, out.Path, out.Name, out.AllowedKeys, eventLogger, knownHosts); err != nil {
 				errChan <- fmt.Errorf("proxy '%s' exited with error: %v", out.Name, err)
 			}
 		}(output)
